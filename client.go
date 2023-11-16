@@ -6,9 +6,11 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,13 +31,23 @@ func isPacketConn(c net.Conn) bool {
 	return true
 }
 
+type Response struct {
+	Msg *Msg
+	Rtt time.Duration
+	Err error
+}
+
 // A Conn represents a connection to a DNS server.
 type Conn struct {
-	net.Conn                         // a net.Conn holding the connection
-	UDPSize        uint16            // minimum receive buffer for UDP messages
-	TsigSecret     map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
-	TsigProvider   TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
-	tsigRequestMAC string
+	net.Conn                           // a net.Conn holding the connection
+	UDPSize          uint16            // minimum receive buffer for UDP messages
+	TsigSecret       map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
+	TsigProvider     TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
+	tsigRequestMAC   string
+	ResponseReceiver chan Response
+	SendStartTime    map[uint16]time.Time
+	ShutDown         chan struct{}
+	sync.Mutex
 }
 
 func (co *Conn) tsigProvider() TsigProvider {
@@ -44,6 +56,43 @@ func (co *Conn) tsigProvider() TsigProvider {
 	}
 	// tsigSecretProvider will return ErrSecret if co.TsigSecret is nil.
 	return tsigSecretProvider(co.TsigSecret)
+}
+
+func (co *Conn) ShutDownReceiver() {
+	co.ShutDown <- struct{}{}
+	co.Close()
+	close(co.ResponseReceiver)
+}
+
+// Receiver Connection multiplexing result receiver,
+// collects results from the connection and differentiates requests based on msg.id
+func (co *Conn) Receiver() {
+	for {
+		select {
+		case <-co.ShutDown:
+			break
+		default:
+			r, err := co.ReadMsg()
+			if r == nil {
+				continue
+			}
+			conResponse := Response{}
+			conResponse.Msg = r
+			conResponse.Err = err
+			co.Lock()
+			startTime, ok := co.SendStartTime[r.Id]
+			if !ok {
+				err = fmt.Errorf("no record msg id")
+			} else {
+				conResponse.Rtt = time.Since(startTime)
+				delete(co.SendStartTime, r.Id)
+			}
+			co.Unlock()
+			go func() {
+				co.ResponseReceiver <- conResponse
+			}()
+		}
+	}
 }
 
 // A Client defines parameters for a DNS client.
@@ -238,6 +287,17 @@ func (c *Client) ExchangeWithConnContext(ctx context.Context, m *Msg, co *Conn) 
 	}
 	rtt = time.Since(t)
 	return r, rtt, err
+}
+
+// ExchangeWithReuseConn Supports one link to send multiple requests msg,
+// use co.Receive() to open the receiver to receive connection returns,
+// and receive return results from ResponseReceiver
+func (c *Client) ExchangeWithReuseConn(m *Msg, co *Conn) (err error) {
+	co.Lock()
+	co.SendStartTime[m.Id] = time.Now()
+	co.Unlock()
+	err = co.WriteMsg(m)
+	return err
 }
 
 // ReadMsg reads a message from the connection co.
