@@ -45,9 +45,8 @@ type Conn struct {
 	TsigProvider     TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
 	tsigRequestMAC   string
 	ResponseReceiver chan Response
-	SendStartTime    map[uint16]time.Time
+	SendStartTime    sync.Map
 	ShutDown         chan struct{}
-	sync.Mutex
 }
 
 func (co *Conn) tsigProvider() TsigProvider {
@@ -79,15 +78,12 @@ func (co *Conn) Receiver() {
 			conResponse := Response{}
 			conResponse.Msg = r
 			conResponse.Err = err
-			co.Lock()
-			startTime, ok := co.SendStartTime[r.Id]
+			startTime, ok := co.SendStartTime.LoadAndDelete(r.Id)
 			if !ok {
 				err = fmt.Errorf("no record msg id")
 			} else {
-				conResponse.Rtt = time.Since(startTime)
-				delete(co.SendStartTime, r.Id)
+				conResponse.Rtt = time.Since(startTime.(time.Time))
 			}
-			co.Unlock()
 			go func() {
 				co.ResponseReceiver <- conResponse
 			}()
@@ -293,9 +289,7 @@ func (c *Client) ExchangeWithConnContext(ctx context.Context, m *Msg, co *Conn) 
 // use co.Receive() to open the receiver to receive connection returns,
 // and receive return results from ResponseReceiver
 func (c *Client) ExchangeWithReuseConn(m *Msg, co *Conn) (err error) {
-	co.Lock()
-	co.SendStartTime[m.Id] = time.Now()
-	co.Unlock()
+	co.SendStartTime.Store(m.Id, time.Now())
 	err = co.WriteMsg(m)
 	return err
 }
