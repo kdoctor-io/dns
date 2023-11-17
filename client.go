@@ -84,9 +84,7 @@ func (co *Conn) Receiver() {
 			} else {
 				conResponse.Rtt = time.Since(startTime.(time.Time))
 			}
-			go func() {
-				co.ResponseReceiver <- conResponse
-			}()
+			co.ResponseReceiver <- conResponse
 		}
 	}
 }
