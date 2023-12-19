@@ -69,7 +69,7 @@ func (co *Conn) Receiver() {
 	for {
 		select {
 		case <-co.ShutDown:
-			break
+			return
 		default:
 			r, err := co.ReadMsg()
 			if r == nil {
